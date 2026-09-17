@@ -31,8 +31,8 @@ both aggregate improvements and remaining failure cases.
 
 > **Scope of this release.** The released method is the final one-step spatial
 > version: one Guide/Normal pass, a 1 mm exterior margin, segment samples no
-> farther than 2 mm apart, and Embree feedback. It has no additional Edge
-> energy, no temporal term or gate, and no second sequence-level pass.
+> farther than 2 mm apart, and Embree feedback. This is the only algorithm
+> configuration documented and exposed by the public entry point.
 
 ---
 
@@ -159,8 +159,12 @@ a curved surface. HairADMM instead places sampled points along the segments in
 an exterior signed-distance constraint and adds samples at residual exact
 intersections.
 
-We do **not** report a QP runtime speedup because a QP time measured under the
-same timing protocol was not retained.
+Historical production QP runs on our server took roughly **300 s/frame**. This
+is a representative engineering estimate rather than a retained 2,702-frame
+solver-internal mean. As a cross-check, the median interval between retained
+QP output timestamps is 282.5 s for `curly` and 318.7 s for `girl_long`;
+simpler hairstyles are faster. We therefore mark the QP time as approximate
+wherever it is compared with the instrumented HairADMM time.
 
 ---
 
@@ -174,9 +178,6 @@ E_{\mathrm{base}}(\mathbf{x})
 +E_{\mathrm{knn}}(\mathbf{x})
 +E_{\mathrm{shape}}(\mathbf{x}).
 $$
-
-There is no additional edge-length or temporal energy in the released
-configuration.
 
 ### 3.1 Fidelity to Init
 
@@ -251,10 +252,9 @@ E_{\mathrm{shape}}
 \right\|_2^2.
 $$
 
-It preserves the direction of every strand edge. Because the current edge is
-normalized, this term by itself does **not** preserve edge length. Length is
-controlled only indirectly by fidelity and KNN structure in this release.
-The optional historical `Edge` term is deliberately disabled.
+It preserves the direction of every strand segment. This direction target
+works together with the fidelity and KNN terms to retain the transferred
+hairstyle while collision constraints move it away from the body.
 
 The normalization makes this term nonlinear. HairADMM therefore uses an outer
 majorization loop: it freezes coefficients computed from the current hair,
@@ -602,9 +602,6 @@ The metrics are:
   winding-number signed distance.
 - **Segment intersections:** exact Embree segment-triangle hits, excluding the
   root-adjacent segment.
-- **Temporal acceleration:**
-  $\|\mathbf{x}_{t+1}-2\mathbf{x}_{t}+\mathbf{x}_{t-1}\|_2$, measured only
-  on non-root points valid in all three consecutive frames.
 - **Algorithm time:** Guide and Normal optimization time, excluding unrelated
   dataset I/O and evaluation.
 
@@ -614,18 +611,14 @@ The metrics are:
 | --- | ---: | ---: | ---: |
 | Point penetrations | 1,275 | 442 | **15** |
 | Segment intersections | 97,490 | 31,598 | **127** |
-| Mean temporal acceleration | 0.635 mm | 1.125 mm | **0.603 mm** |
-| Mean algorithm time | — | not retained | **4.119 s/frame** |
+| Per-frame runtime | — | **~300 s** (historical estimate) | **4.119 s** (instrumented algorithm time) |
 
 Relative to QP, HairADMM reduces measured point penetrations by **96.61%** and
-segment intersections by **99.60%**. Mean temporal acceleration is **46.40%**
-lower than QP even though the released objective has no temporal term.
-
-The temporal result is an empirical side effect, not a temporal guarantee.
-The deterministic per-frame objective and stronger segment-aware collision
-repair avoid many abrupt local QP corrections on average, but frames are not
-coupled. The worst measured HairADMM temporal outlier is still 72.72 mm on
-`curly` frame 57.
+segment intersections by **99.60%**. Comparing the representative historical
+QP estimate with the recorded HairADMM mean gives a representative speed ratio
+of roughly **72.8x**. This ratio is an engineering reference, not a controlled
+solver benchmark: the QP number is a historical wall-clock estimate, whereas
+4.119 s is the mean solver-recorded HairADMM algorithm time.
 
 Detailed definitions are repeated in
 [`results/README.md`](results/README.md), and the machine-readable summary is
@@ -665,9 +658,20 @@ it does not reproduce the historical root-weight overwrite behavior.
 
 ---
 
-## 10. Installation and reproducible toy example
+## 10. Installation, server environment, and toy example
 
-The tested environment is Linux with Python 3.10.
+The full evaluation was run on the following server environment:
+
+- Ubuntu 22.04.4 LTS, Linux 6.5;
+- 2x Intel Xeon Silver 4210R CPUs, 20 physical cores / 40 logical CPUs total;
+- 125 GiB system memory;
+- 4x NVIDIA GeForce RTX 3090, 24 GiB each;
+- Python 3.10.0;
+- NumPy 1.26.4, SciPy 1.12.0, trimesh 4.8.3, embreex 4.4.0,
+  libigl 2.5.0, CVXPY 1.7.5, and OSQP 1.0.5.
+
+The released HairADMM solver uses CPU sparse linear algebra and does not
+require the GPUs. Create the portable release environment with:
 
 ```bash
 conda env create -f environment.yml
@@ -744,18 +748,14 @@ Body files must be named `body_<frame>.obj`; hair files may be
   normals and can be unreliable for severely non-watertight meshes.
 - Roots and root-adjacent segments are intentionally excluded from collision
   evaluation because roots attach at the scalp.
-- There is no explicit length energy in the released method. On the measured
-  dataset, global relative length RMSE is 9.874%.
-- Frames are independent. Lower mean temporal acceleration is observed, but
-  the method cannot prevent every temporal outlier.
 - All 127 remaining measured segment intersections are concentrated in the
   `girl_long` sequence.
 - The full private dataset and body/hairstyle assets are not distributed.
 - Applying the method to a new transfer pipeline requires an adapter that
   exports its data to the canonical bundle schema. This repository includes a
   complete toy generator, but not a universal raw-hair transfer or converter.
-- A directly comparable historical-QP timing was not retained, so no measured
-  speedup claim over QP is made.
+- The approximately 300 s/frame QP reference is based on historical runs and
+  retained output timestamps, not a newly repeated solver-internal benchmark.
 
 ---
 

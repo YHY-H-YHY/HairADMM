@@ -2,8 +2,7 @@
 """Public one-step entry point for HairADMM.
 
 This wrapper intentionally exposes only the final release configuration:
-2 mm uniform segment sampling plus Embree feedback, without Edge energy,
-temporal gating, or a second solve pass.
+2 mm uniform segment sampling plus Embree feedback in one Guide/Normal pass.
 """
 
 from __future__ import annotations
@@ -63,9 +62,6 @@ def main() -> None:
         "--inner_iters", "10",
         "--min_inner_iters", "10",
         "--rho", "100000",
-        "--w_edge_length", "0",
-        "--w_bend_continuity", "0",
-        "--w_temporal_correction", "0",
     ]
     if args.force:
         argv.append("--force")

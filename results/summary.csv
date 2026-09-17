@@ -1,0 +1,4 @@
+method,frames,point_penetrations,segment_intersections,temporal_acceleration_mean_mm,algorithm_time_mean_s_per_frame
+Init,2702,1275,97490,0.634525,
+QP baseline,2702,442,31598,1.125154,
+HairADMM one-step,2702,15,127,0.603046,4.119119

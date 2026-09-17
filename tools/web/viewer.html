@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HairADMM Viewer</title>
+  <link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+  <main id="viewport" aria-label="3D hair and body viewer"></main>
+
+  <section id="controls">
+    <div class="frame-row">
+      <span>Frame</span>
+      <strong id="lblFrame">0</strong>
+      <span>/</span>
+      <span id="lblTotal">0</span>
+    </div>
+    <input type="range" id="frameSlider" min="0" max="0" value="0" step="1" aria-label="Current frame">
+    <div class="button-row">
+      <button id="btnPrev" type="button" title="Previous frame" aria-label="Previous frame">◀</button>
+      <button id="btnPlay" type="button">▶ Play</button>
+      <button id="btnNext" type="button" title="Next frame" aria-label="Next frame">▶</button>
+    </div>
+    <label class="field-row" for="playbackSpeed">
+      <span>Playback speed</span>
+      <select id="playbackSpeed">
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="1.5">1.5x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+      </select>
+    </label>
+    <label class="cut-row" for="bodyCutSlider">
+      <span>Body cut</span>
+      <output id="lblBodyCut">55%</output>
+    </label>
+    <input type="range" id="bodyCutSlider" min="35" max="75" value="55" step="1" aria-label="Body cut height">
+    <label class="field-row" for="hairMode">
+      <span>Hair display</span>
+      <select id="hairMode">
+        <option value="all">All</option>
+        <option value="strand">Single strand</option>
+        <option value="point">Single point</option>
+      </select>
+    </label>
+    <label class="field-row" for="strandIndex">
+      <span>Strand index</span>
+      <input id="strandIndex" type="number" min="0" value="0" step="1">
+    </label>
+    <label class="field-row" for="pointIndex">
+      <span>Point index</span>
+      <input id="pointIndex" type="number" min="0" value="0" step="1">
+    </label>
+    <div class="selection-row">
+      <span>Selected strand</span>
+      <output id="selectedStrand">--</output>
+    </div>
+    <div class="button-row">
+      <button id="btnBody" type="button">Hide body</button>
+      <button id="btnReset" type="button">Reset view</button>
+    </div>
+  </section>
+
+  <div id="status" role="status">Loading...</div>
+
+  <script type="importmap">
+    {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js"}}
+  </script>
+  <script type="module" src="viewer.js?v=7"></script>
+</body>
+</html>

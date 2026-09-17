@@ -1,0 +1,12 @@
+name: hairadmm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy=1.26.4
+  - scipy=1.12.0
+  - igl=2.5.0
+  - pip
+  - pip:
+      - trimesh==4.8.3
+      - embreex==4.4.0

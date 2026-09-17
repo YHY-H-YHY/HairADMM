@@ -1,0 +1,18 @@
+{
+  "algorithm": "HairADMM one-step",
+  "objective": "QP-aligned fidelity + KNN Laplacian + dynamic shape",
+  "w_fid": 1000.0,
+  "w_lap": 3000.0,
+  "w_lap_normal": 30000.0,
+  "rho": 100000.0,
+  "collision_standard": "sdf_projection",
+  "sdf_margin_mm": 1.0,
+  "sdf_uniform_segment_samples": true,
+  "sdf_max_spacing_mm": 2.0,
+  "sdf_embree_feedback": true,
+  "sdf_embree_refine_iters": 2,
+  "outer_iters": 4,
+  "shape_outer_iters": 4,
+  "inner_iters": 10,
+  "passes": 1
+}

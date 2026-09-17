@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.codex/
+.agents/
+.env
+.env.*
+
+# Generated outputs and browser caches.
+outputs/
+examples/toy_case/output/
+tools/web/cache/
+tools/web/frames_*.json
+
+# Large/private datasets are never part of the public repository.
+data/
+datasets/
+*.abc

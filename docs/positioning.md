@@ -72,7 +72,7 @@ $$
 $$
 CX=Z,
 \qquad
-Z\in\operatorname{exterior}(\mathrm{body},1\text{ mm}).
+Z\in\mathrm{exterior}(\mathrm{body},1\text{ mm}).
 $$
 
 $Z$ 的每一行都是一个三维位置，而不是标量约束值。z-update 查询人体有符号距离，并将

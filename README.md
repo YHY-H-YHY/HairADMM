@@ -26,7 +26,7 @@ $$
 
 $$
 Z^{k+1}
-=\operatorname{prox}_g(AX^{k+1}+U^k),
+=\mathrm{prox}_g(AX^{k+1}+U^k),
 $$
 
 $$
@@ -185,7 +185,7 @@ $$
 若 Embree 在 $\alpha_{\mathrm{hit}}$ 处检测到残余交点，下一轮额外加入
 
 $$
-\operatorname{clip}
+\mathrm{clip}
 \left(
 \alpha_{\mathrm{hit}}+\delta,\ 0.02,\ 0.98
 \right),
@@ -250,7 +250,7 @@ Embree 检测残余线段交点
 - $R$：outer 次数，$I$：每个 outer 的 inner ADMM 次数；
 - $J_G$：Guide 中 PCG 的迭代次数；
 - $Q_G,Q_N$：一次 z-update 中真正执行精确 SDF 查询的 active 样本数；
-- $S_G=\operatorname{nnz}(H_G+\rho C_G^\top C_G)$。
+- $S_G=\mathrm{nnz}(H_G+\rho C_G^\top C_G)$。
 
 ### 4.1 泛用 QP/OSQP
 

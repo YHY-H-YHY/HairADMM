@@ -1,11 +1,14 @@
 # HairADMM
 
-**面向三维发丝图的快速碰撞后处理**
+**面向三维发丝图的快速、线段感知及时序稳定的后处理**
 
-HairADMM 用于处理发型迁移后的穿模问题。输入是已经迁移到目标人物上的发丝和目标人体
-网格，输出是在尽量保持原发型的同时减少人体穿透的发丝。
+HairADMM 用于处理发型迁移后的三个工程问题：线段穿过人体、通用 QP 后处理生成时间长，
+以及逐帧独立优化造成的帧间抖动。输入是已经迁移到目标人物上的发丝和目标人体网格，
+输出是在尽量保持原发型的同时减少人体穿透并抑制时序尖峰的发丝序列。
 
-它不负责生成或迁移发型，只负责迁移完成后的这一步优化。
+它不负责从零生成或迁移发型；这里的“生成时间”特指迁移完成后产生最终无碰撞发丝的
+优化时间。完整序列模式包含线段碰撞、结构化快速求解和时序门禁；单帧 toy demo 因为
+没有前后帧，只演示前两部分。
 
 ## 1. 泛用 ADMM 在做什么？
 
@@ -195,6 +198,28 @@ $$
 
 这些比例对应交点及其左右邻域，生成新的 $C$ 行后继续求解。
 
+### 性质五：帧间抖动表现为离散时间二阶差分尖峰
+
+对连续三帧中的同一个发丝点，令当前待求位置为 $X_i^t$，相邻参考帧为
+$\widehat X_i^{t-1}$ 和 $\widehat X_i^{t+1}$。其离散时间加速度为
+
+$$
+A_i^t
+=\widehat X_i^{t-1}-2X_i^t+\widehat X_i^{t+1}.
+$$
+
+HairADMM 只在 $\|A_i^t\|_2$ 超过由 Init 序列运动幅度确定的阈值 $r_i^t$ 时激活
+时序门禁，并在 ADMM 中投影到半径为 $r_i^t$ 的三维球：
+
+$$
+Z_{T,i}
+=\Pi_{\|\cdot\|_2\le r_i^t}
+\left(A_i^t+U_{T,i}\right).
+$$
+
+这不是把整段动画强行平滑，而是限制异常的二阶位移尖峰：正常运动保持不变，只有超过
+阈值的点进入 active set，从而减少逐帧碰撞修复产生的可见抖动。
+
 ## 3. 我们对泛用 ADMM 做了什么优化？
 
 总体上，我们把泛用 ADMM 改成了一个专门服务于三维发丝图的求解器：
@@ -217,6 +242,7 @@ $CX$ 与 $Z$ 的不一致。
 | 对标量约束区间做投影 | 对三维发丝采样点做人体外部投影 |
 | 约束矩阵通常固定 | 根据残余交点动态扩充采样矩阵 $C$ |
 | 历史实现主要约束顶点 | 同时约束顶点和线段内部位置 |
+| 各帧通常独立求解 | 对异常的三帧二阶位移启用稀疏时序门禁 |
 
 算法流程为：
 
@@ -236,7 +262,9 @@ Embree 检测残余线段交点
         ↓
 如有必要，在交点附近增加约束并继续求解
         ↓
-输出碰撞减少后的发丝
+序列模式对异常二阶位移执行时序门禁
+        ↓
+输出碰撞减少、时序更稳定的发丝
 ~~~
 
 ## 4. 理论时间与空间复杂度
@@ -250,7 +278,8 @@ Embree 检测残余线段交点
 - $R$：outer 次数，$I$：每个 outer 的 inner ADMM 次数；
 - $J_G$：Guide 中 PCG 的迭代次数；
 - $Q_G,Q_N$：一次 z-update 中真正执行精确 SDF 查询的 active 样本数；
-- $S_G=\mathrm{nnz}(H_G+\rho C_G^\top C_G)$。
+- $M_{T,G},M_{T,N}$：Guide 和 Normal 中激活的时序门禁点数；
+- $S_G=\mathrm{nnz}(H_G+\rho C_G^\top C_G+\rho_T A_{T,G}^\top A_{T,G})$。
 
 ### 4.1 泛用 QP/OSQP
 
@@ -286,7 +315,7 @@ T_G
 =\mathcal O\!\Bigl(
 R\bigl[
 S_G
-+I(3J_GS_G+M_G+Q_G\log F)
++I(3J_GS_G+M_G+M_{T,G}+Q_G\log F)
 +E_G\log F
 \bigr]
 \Bigr).
@@ -297,16 +326,18 @@ $$
 
 - $3J_GS_G$ 是三个坐标的 PCG；
 - $M_G$ 是 $C_GX$、$C_G^\top Z$ 和 u-update；
+- $M_{T,G}$ 是 active 时序门禁的投影和对偶更新；
 - $Q_G\log F$ 是复用人体 AABB 树后的 active SDF 查询；
 - $E_G\log F$ 是 Embree 线段查询的平均输出敏感成本。
 
 ### 4.3 HairADMM 的 Normal
 
-当前 one-step 版本没有 Edge 和时序耦合。Normal 的基础目标是逐点目标，方向项和线段
-采样只连接同一根发丝上的相邻点，因此其矩阵由彼此独立、带宽受限的发丝链组成。记
+Normal 的基础目标是逐点目标，方向项、线段采样和 active 时序门禁都只引入逐点或同一根
+发丝上的局部关系，因此其矩阵由彼此独立、带宽受限的发丝链组成。单帧模式没有前后帧
+参考，令 $M_{T,N}=0$。记
 
 $$
-S_N=\mathcal O(N_N+M_N).
+S_N=\mathcal O(N_N+M_N+M_{T,N}).
 $$
 
 每个 outer 只分解一次，三个坐标和全部 inner 迭代复用该分解：
@@ -316,7 +347,7 @@ T_N
 =\mathcal O\!\Bigl(
 R\bigl[
 S_N
-+I(3S_N+M_N+Q_N\log F)
++I(3S_N+M_N+M_{T,N}+Q_N\log F)
 +E_N\log F
 \bigr]
 \Bigr).
@@ -324,7 +355,8 @@ $$
 
 ### 4.4 总复杂度
 
-令 $M=M_G+M_N$、$Q=Q_G+Q_N$、$E=E_G+E_N$。HairADMM 单帧的主要时间复杂度为
+令 $M=M_G+M_N$、$M_T=M_{T,G}+M_{T,N}$、$Q=Q_G+Q_N$、$E=E_G+E_N$。
+HairADMM 处理一帧时的主要时间复杂度为
 
 $$
 \boxed{
@@ -332,7 +364,7 @@ T_{\mathrm{HairADMM}}
 =\mathcal O\!\left(
 RI J_GS_G
 +RI S_N
-+RI(M+Q\log F)
++RI(M+M_T+Q\log F)
 +RE\log F
 \right)
 }
@@ -343,7 +375,7 @@ $$
 $$
 \boxed{
 \mathcal M_{\mathrm{HairADMM}}
-=\mathcal O(S_G+S_N+M+F)
+=\mathcal O(S_G+S_N+M+M_T+F)
 }
 $$
 
@@ -358,6 +390,7 @@ AABB/BVH 的平均 $\mathcal O(\log F)$ 因子。这里的“近线性”依赖 
 | HairADMM Guide x-update | 三个坐标共享同一个 $N_G\times N_G$ 稀疏系统 | $\mathcal O(3RIJ_GS_G)$ | $\mathcal O(S_G+M_G)$ |
 | HairADMM Normal x-update | 彼此独立、带宽受限的发丝链 | $\mathcal O(RI S_N)$ | $\mathcal O(S_N+M_N)$ |
 | HairADMM 几何查询 | active SDF 查询与 Embree 线段检测 | 平均 $\mathcal O(RIQ\log F+RE\log F)$ | $\mathcal O(F+M)$ |
+| HairADMM 时序门禁 | active 三帧二阶位移投影 | $\mathcal O(RI M_T)$ | $\mathcal O(M_T)$ |
 
 ## 5. 当前碰撞结果（纯数值）
 
@@ -368,7 +401,9 @@ AABB/BVH 的平均 $\mathcal O(\log F)$ 因子。这里的“近线性”依赖 
 | 穿入人体的发丝点数 | 1,275 | 442 | **15** | **96.61%** |
 | 线段与人体相交数 | 97,490 | 31,598 | **127** | **99.60%** |
 
-运行时间暂不作为当前发布结论，后续将在统一硬件、输入、线程数和计时边界下重新评估。
+当前历史记录显示，旧 QP 后处理约为 300 s/帧，HairADMM 的算法内部均值约为
+4.119 s/帧，体现了从分钟级到秒级的工程改进。由于两者计时来源不同，这里不把它写成
+精确的公平加速倍数；最终速度和时序抖动数字仍应按统一硬件、输入和评价程序重新测量。
 
 ## 6. 快速运行
 

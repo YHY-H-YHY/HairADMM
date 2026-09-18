@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Public one-step entry point for HairADMM.
+"""Public entry point for geometry-aware ADMM on 3D strand graphs.
 
 This wrapper intentionally exposes only the final release configuration:
 2 mm uniform segment sampling plus Embree feedback in one Guide/Normal pass.
+The specialization combines a graph-structured x-update, exterior-set z-update,
+and adaptive segment sampling operator.
 """
 
 from __future__ import annotations
@@ -14,7 +16,10 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the final one-step HairADMM post-processor."
+        description=(
+            "Run HairADMM geometry-aware collision optimization on a 3D "
+            "strand graph."
+        )
     )
     parser.add_argument(
         "--objective_tensor_dir",

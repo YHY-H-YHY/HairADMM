@@ -12,9 +12,17 @@ __pycache__/
 
 # Generated outputs and browser caches.
 outputs/
+output/
 examples/toy_case/output/
 tools/web/cache/
 tools/web/frames_*.json
+
+# Local visualization drafts and rendered previews.
+figures/
+tmp/
+.build/
+results/charts/
+docs/assets/equations/
 
 # Large/private datasets are never part of the public repository.
 data/

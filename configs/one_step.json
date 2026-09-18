@@ -1,5 +1,6 @@
 {
-  "algorithm": "HairADMM one-step",
+  "algorithm": "HairADMM geometry-aware graph ADMM",
+  "positioning": "structured x-update + geometric z-update + adaptive segment operator",
   "objective": "QP-aligned fidelity + KNN Laplacian + dynamic shape",
   "w_fid": 1000.0,
   "w_lap": 3000.0,

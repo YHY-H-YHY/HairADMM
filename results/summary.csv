@@ -1,4 +1,4 @@
-method,frames,point_penetrations,segment_intersections,runtime_s_per_frame,runtime_scope
-Init,2702,1275,97490,,not measured
-QP baseline,2702,442,31598,300,approximate historical wall-clock reference
-HairADMM one-step,2702,15,127,4.119119,solver-recorded algorithm mean
+method,frames,point_penetrations,segment_intersections,result_status
+Init,2702,1275,97490,preliminary retained record
+Historical vertex-QP baseline,2702,442,31598,preliminary retained record
+HairADMM geometry-aware graph solver,2702,15,127,preliminary pending controlled component rerun

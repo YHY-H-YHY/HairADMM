@@ -1,778 +1,440 @@
 # HairADMM
 
-**A one-step ADMM post-processor for collision-aware hairstyle transfer**
+**面向三维发丝图的快速碰撞后处理**
 
-## Abstract
+HairADMM 用于处理发型迁移后的穿模问题。输入是已经迁移到目标人物上的发丝和目标人体
+网格，输出是在尽量保持原发型的同时减少人体穿透的发丝。
 
-HairADMM removes body penetrations from a transferred hairstyle while trying
-to preserve the hairstyle produced by the original transfer method. It is a
-replacement for the quadratic-programming (QP) post-processing stage in our
-pipeline; it is **not** a method for generating or transferring a hairstyle
-from scratch.
+它不负责生成或迁移发型，只负责迁移完成后的这一步优化。
 
-The central idea is to separate two tasks that are difficult to solve at the
-same time:
+## 1. 泛用 ADMM 在做什么？
 
-1. preserve the transferred hairstyle; and
-2. keep sampled points on every hair strand at least 1 mm outside the body.
-
-ADMM alternates between these two tasks. A sparse linear solve updates the
-hair shape, a signed-distance projection moves collision samples outside the
-body, and a dual variable makes the two results agree. Uniform samples along
-each hair segment and exact Embree intersection feedback address collisions
-that vertex-only constraints can miss.
-
-The release makes three contributions: a canonical tensor contract that keeps
-the QP and ADMM hairstyle objectives aligned; an ADMM formulation that splits
-sparse hairstyle reconstruction from exterior-body projection; and a
-segment-aware constraint-generation scheme combining deterministic sampling
-with exact Embree feedback. We evaluate the method on 2,702 frames and report
-both aggregate improvements and remaining failure cases.
-
-> **Scope of this release.** The released method is the final one-step spatial
-> version: one Guide/Normal pass, a 1 mm exterior margin, segment samples no
-> farther than 2 mm apart, and Embree feedback. This is the only algorithm
-> configuration documented and exposed by the public entry point.
-
----
-
-## 1. Problem statement
-
-### 1.1 What is a hairstyle in this project?
-
-A hairstyle is a collection of polyline strands. Strand $s$ consists of 3D
-points
+对一个带约束的优化问题，ADMM 通常引入辅助变量 $Z$：
 
 $$
-\mathbf{x}_{s,0},\mathbf{x}_{s,1},\ldots,
-\mathbf{x}_{s,n_s-1}\in\mathbb{R}^3.
+\min_{X,Z} f(X)+g(Z),
+\qquad AX=Z.
 $$
 
-Consecutive points form a straight segment. Point $\mathbf{x}_{s,0}$ is the
-root attached to the scalp. Roots remain fixed during optimization; all other
-points are variables.
-
-The target body is an oriented triangle mesh
+然后反复执行：
 
 $$
-\mathcal M=(V,F).
+X^{k+1}
+=\arg\min_X f(X)
++\frac{\rho}{2}\|AX-Z^k+U^k\|^2,
 $$
 
-The mesh represents the head and body that the hair must remain outside of.
-All positions in the optimization files use metres.
-
-### 1.2 What does “initial transfer” (`Init`) mean?
-
-An upstream hairstyle-transfer method first moves a source hairstyle to a
-target character. That upstream method may use skinning, root correspondence,
-an affine transformation, a learned model, or another deformation method;
-HairADMM does not prescribe it.
-
-Its output is called the **initial transfer** or **Init**:
-
 $$
-\mathbf{x}^{\mathrm{init}}
-=\{\mathbf{x}^{\mathrm{init}}_{s,j}\}.
+Z^{k+1}
+=\operatorname{prox}_g(AX^{k+1}+U^k),
 $$
 
-Init normally has the correct hairstyle and roughly correct root placement,
-but some points or whole segments may pass through the target body. Moving
-every colliding point independently would remove the penetration but could
-destroy the hairstyle. HairADMM therefore treats Init as a shape target rather
-than blindly projecting it.
+$$
+U^{k+1}
+=U^k+AX^{k+1}-Z^{k+1}.
+$$
 
-In addition, the solver receives a **source-aligned hairstyle**
-$\mathbf{x}^{\mathrm{src}}$. It is the source hairstyle expressed in the
-same coordinate frame and with the same strand topology as Init. It supplies
-the original strand directions and local cross-strand offsets that should be
-preserved.
+泛用求解器需要面对各种不同问题，因此通常会：
 
-### 1.3 Input and output
+- 把所有未知量打包成一个通用向量；
+- 求解通用稀疏线性系统或 KKT 系统；
+- 使用固定约束矩阵；
+- 对标量区间或其他通用集合做投影。
 
-For one frame, the conceptual input is:
+OSQP 就是一个基于 ADMM 的通用 QP 求解器。因此，我们的方法并不是“用 ADMM
+替代 QP”，而是针对发丝问题重新设计 ADMM 的变量、线性系统和碰撞约束。
 
-- the initial transferred hair $\mathbf{x}^{\mathrm{init}}$;
-- the source-aligned hair $\mathbf{x}^{\mathrm{src}}$;
-- the target body mesh $\mathcal M$;
-- strand topology and fixed roots;
-- the Guide subset, KNN graphs, KNN weights, local weights, and energy weights.
+历史 QP 对发生碰撞的顶点使用局部切平面约束：
 
-The output is an optimized hairstyle $\mathbf{x}^{*}$ that remains close to
-Init and to the source hairstyle's local structure while greatly reducing
-body penetration.
+$$
+\min_X E_{\mathrm{hair}}(X),
+\qquad
+\mathbf n_i^\top(X_i-\mathbf q_i)\ge\varepsilon.
+$$
 
-```mermaid
-flowchart LR
-    A[Source hairstyle] --> B[Upstream transfer]
-    T[Target character] --> B
-    B --> C[Init: transferred but possibly colliding]
-    C --> D[Old pipeline: QP post-processing]
-    C --> E[This work: HairADMM post-processing]
-    S[Source-aligned shape] --> E
-    M[Target body mesh] --> E
-    E --> O[Collision-reduced hairstyle]
-```
+其中 $\mathbf q_i$ 是人体表面点，$\mathbf n_i$ 是该处外法向。这个表达式只直接约束
+顶点 $X_i$，并且依赖当前固定的局部平面。
 
-Thus “one-step” means one HairADMM post-processing pass after Init. It does
-not mean that HairADMM also performs the upstream hairstyle transfer.
+## 2. 发丝问题有哪些可以利用的性质？
 
----
+发型可以看成一个三维几何图：
 
-## 2. What was the original QP?
+- 同一根发丝上的相邻点组成发丝边；
+- 不同发丝之间的 KNN 关系组成跨发丝边；
+- 每个点都有 x、y、z 三个坐标，但三个坐标的图连接关系完全相同；
+- 碰撞不仅可能发生在顶点，也可能发生在两个顶点之间的线段内部。
 
-The original pipeline also repaired Init after transfer. At each outer
-iteration it formed a quadratic approximation of the hairstyle-preservation
-objective and solved a constrained quadratic program. In simplified form,
+这些性质意味着我们没有必要把它当成一个完全泛用的 QP。
+
+需要保持的发型目标可以概括为
 
 $$
 \begin{aligned}
-\min_{\mathbf{x}}\quad & E_{\mathrm{base}}(\mathbf{x})\\
-\text{s.t.}\quad &
-\mathbf{n}_i^\top(\mathbf{x}_i-\mathbf{q}_i)\ge \varepsilon,
-\qquad i\in\mathcal A.
+E_{\mathrm{hair}}(X)
+= {}&
+\frac{w_{\mathrm{fid}}}{2}
+\sum_i\omega_i\|X_i-X_i^{\mathrm{init}}\|_2^2\\
+&+\frac{w_{\mathrm{knn}}}{2}
+\|LX-\Delta^{\mathrm{src}}\|_W^2\\
+&+\frac{w_{\mathrm{dir}}}{2}
+\sum_{(i,j)}
+\left\|
+\frac{X_j-X_i}{\|X_j-X_i\|_2}
+-d_{ij}^{\mathrm{src}}
+\right\|_2^2 .
 \end{aligned}
 $$
 
-Here $\mathbf{q}_i$ is a nearby surface point, $\mathbf{n}_i$ is its
-outward normal, $\varepsilon$ is a small clearance (0.1 mm in the historical
-branch represented here), and $\mathcal A$ is the current set of colliding or
-active hair vertices. Once the surface points, normals, and nonlinear
-direction terms are frozen, both the objective and constraints are
-quadratic/linear, hence the name QP.
+三项分别保持 Init 位置、跨发丝 KNN 结构和源发丝方向。碰撞处理是在这个共同目标之外
+增加的约束，而不是用逐点投影替代整个发型目标。
 
-The QP is important for two reasons:
+### 性质一：三个坐标共享同一个图结构
 
-1. it defines the historical baseline against which HairADMM is evaluated;
-2. its base hairstyle objective is reused by HairADMM so that the comparison
-   changes the collision-handling solver rather than silently changing the
-   intended hairstyle.
-
-The canonical `.npz` bundle in this repository is exported immediately before
-the historical QP solve. HairADMM consumes the same Init, source alignment,
-Guide selection, KNN graphs, KNN weights, local weights, and energy weights.
-
-The limitation addressed here is primarily collision semantics. A constraint
-on a vertex does not constrain the entire segment between two vertices. Two
-endpoints can both be outside a surface while the straight segment joining
-them still crosses it. Local tangent planes also describe only a local view of
-a curved surface. HairADMM instead places sampled points along the segments in
-an exterior signed-distance constraint and adds samples at residual exact
-intersections.
-
-Historical production QP runs on our server took roughly **300 s/frame**. This
-is a representative engineering estimate rather than a retained 2,702-frame
-solver-internal mean. As a cross-check, the median interval between retained
-QP output timestamps is 282.5 s for `curly` and 318.7 s for `girl_long`;
-simpler hairstyles are faster. We therefore mark the QP time as approximate
-wherever it is compared with the instrumented HairADMM time.
-
----
-
-## 3. Shared hairstyle objective
-
-HairADMM minimizes the same three base terms used by the QP-aligned pipeline:
+经过当前 outer 迭代的二次化后，x-update 可以写成
 
 $$
-E_{\mathrm{base}}(\mathbf{x})
-=E_{\mathrm{fit}}(\mathbf{x})
-+E_{\mathrm{knn}}(\mathbf{x})
-+E_{\mathrm{shape}}(\mathbf{x}).
+(H+\rho C^\top C)X
+=B+\rho C^\top(Z-U).
 $$
 
-### 3.1 Fidelity to Init
+其中 $X\in\mathbb R^{N\times3}$。
+
+同一个 $N\times N$ 稀疏矩阵同时用于 x、y、z 三个坐标，只是右端项不同。这样不需要
+把问题扩成一个不透明的 $3N$ 维通用系统。
+
+### 性质二：Guide 和 Normal 的耦合方式不同
+
+Guide 发丝决定整体形变，需要求解带 KNN 耦合的图系统；Normal 发丝主要跟随已经求出
+的 Guide，其系统结构更简单。
+
+Guide 的跨发丝关系写成
 
 $$
-E_{\mathrm{fit}}(\mathbf{x})
-=\frac{w_{\mathrm{fid}}}{2}
-\sum_i \omega_i
-\left\|\mathbf{x}_i-\mathbf{x}^{\mathrm{init}}_i\right\|_2^2.
+(LX^G)_i
+=\sum_{j\in\mathcal N(i)}a_{ij}(X_i^G-X_j^G)
+\approx\Delta_i^{\mathrm{src}}.
 $$
 
-This term says: do not change the upstream transfer more than necessary.
-$\omega_i$ is the supplied local weight, and the released value is
-$w_{\mathrm{fid}}=1000$.
-
-### 3.2 Cross-strand KNN structure
-
-For point $i$, let $\mathcal N(i)$ be its cross-strand neighbors and
-$a_{ij}$ their supplied weights, which are normally normalized per point. The
-weighted graph Laplacian is
+Guide 求出后，Normal 点获得逐点目标
 
 $$
-(L\mathbf{x})_i
-=\sum_{j\in\mathcal N(i)}a_{ij}(\mathbf{x}_i-\mathbf{x}_j).
+T_i
+=\sum_{j\in\mathcal N(i)}a_{ij}\widehat X_j^G
++\Delta_i^{\mathrm{src}},
+\qquad X_i^N\approx T_i.
 $$
 
-This is not a physical Laplacian of the body mesh. It measures where one hair
-point lies relative to nearby points on other strands. Preserving it helps a
-bundle of strands deform coherently instead of being repaired one by one.
+因此我们采用：
 
-For Guide points, the source target is
+- Guide：使用带预条件和 warm start 的 CG；
+- Normal：每个 outer 只分解一次矩阵，在所有 inner ADMM 迭代和三个坐标间复用。
 
-$$
-\boldsymbol\delta_i^{\mathrm{src}}
-=(L\mathbf{x}^{\mathrm{src}})_i,
-$$
+### 性质三：碰撞约束本质上是三维几何约束
 
-and the Guide KNN energy is
+传统 QP 对顶点建立局部切平面约束，再把标量结果限制在某个区间内。HairADMM 中，
+本项目中的 $Z$ 直接保存发丝采样点的三维位置：
 
 $$
-E_{\mathrm{knn}}^{G}
-=\frac{w_{\mathrm{lap}}}{2}
-\sum_i \lambda_i
-\left\|(L\mathbf{x}^{G})_i-
-\boldsymbol\delta_i^{\mathrm{src}}\right\|_2^2,
+CX=Z,\qquad Z\in\Omega_{1\mathrm{mm}}.
 $$
 
-with $w_{\mathrm{lap}}=3000$. In plain language, optimized Guide strands
-should retain their source cross-strand relationships.
+其中 $\Omega_{1\mathrm{mm}}$ 表示距离人体表面至少 1 mm 的外部区域。
 
-### 3.3 Strand-direction preservation
-
-For an edge $(i,j)$, define
+令
 
 $$
-\mathbf{e}_{ij}=\mathbf{x}_j-\mathbf{x}_i,
+Y=CX^{k+1}+U^k,\qquad m=1\text{ mm}.
+$$
+
+若 $\phi(Y_r)$ 是人体外为正的有符号距离，$\mathbf n(Y_r)$ 是外法向，则 z-update
+可以概括为
+
+$$
+Z_r^{k+1}
+=
+\begin{cases}
+Y_r, & \phi(Y_r)\ge m,\\
+Y_r+\bigl(m-\phi(Y_r)\bigr)\mathbf n(Y_r),
+& \phi(Y_r)<m.
+\end{cases}
+$$
+
+也就是说，安全点保持不变，不安全点被推到人体表面外 1 mm。
+
+### 性质四：只约束顶点不能发现所有线段穿模
+
+两个端点都在人体外时，它们之间的线段仍可能穿过人体。为此，$C$ 不只选择发丝顶点，
+还计算线段内部的仿射采样点：
+
+$$
+(CX)_r=(1-\alpha)X_i+\alpha X_j.
+$$
+
+对长度为 $\ell_{ij}$ 的线段，均匀采样数由
+
+$$
+n_{ij}
+=\left\lceil\frac{\ell_{ij}}{2\text{ mm}}\right\rceil,
 \qquad
-\mathbf{d}^{\mathrm{src}}_{ij}
-=\frac{\mathbf{x}^{\mathrm{src}}_j-
-\mathbf{x}^{\mathrm{src}}_i}
-{\left\|\mathbf{x}^{\mathrm{src}}_j-
-\mathbf{x}^{\mathrm{src}}_i\right\|_2}.
+\alpha_q=\frac{q}{n_{ij}},
+\quad q=1,\ldots,n_{ij}-1.
 $$
 
-The shape term is
+确定，所以相邻检查位置最多相隔 2 mm。
+
+若 Embree 在 $\alpha_{\mathrm{hit}}$ 处检测到残余交点，下一轮额外加入
 
 $$
-E_{\mathrm{shape}}
-=\frac{1}{2}\sum_{(i,j)}
-\left\|
-\frac{\mathbf{e}_{ij}}{\|\mathbf{e}_{ij}\|_2}
--\mathbf{d}^{\mathrm{src}}_{ij}
-\right\|_2^2.
+\operatorname{clip}
+\left(
+\alpha_{\mathrm{hit}}+\delta,\ 0.02,\ 0.98
+\right),
+\qquad
+\delta\in\{-0.10,0,0.10\}.
 $$
 
-It preserves the direction of every strand segment. This direction target
-works together with the fidelity and KNN terms to retain the transferred
-hairstyle while collision constraints move it away from the body.
+这些比例对应交点及其左右邻域，生成新的 $C$ 行后继续求解。
 
-The normalization makes this term nonlinear. HairADMM therefore uses an outer
-majorization loop: it freezes coefficients computed from the current hair,
-obtains a quadratic surrogate, solves that surrogate, and rebuilds it at the
-next outer iteration.
+## 3. 我们对泛用 ADMM 做了什么优化？
 
----
+总体上，我们把泛用 ADMM 改成了一个专门服务于三维发丝图的求解器：
 
-## 4. Why solve Guide strands before Normal strands?
-
-Solving all densely sampled strands with a full KNN matrix is expensive and
-unnecessary. The input partitions the hairstyle into:
-
-- **Guide strands:** a representative subset that establishes the large-scale
-  deformation; and
-- **Normal strands:** the remaining dense strands that follow the Guides while
-  preserving their original relative offsets.
-
-HairADMM first optimizes the Guide variables $\mathbf{x}^{G}$ using the full
-Guide KNN energy above. It then creates a neighbor field
-$\widehat{\mathbf{x}}$: Guide entries contain the optimized Guide positions,
-while any non-Guide entries allowed by the supplied graph remain at Init. The
-target for each Normal point is
+完整分裂问题为
 
 $$
-\mathbf{t}_i
-=\sum_{j\in\mathcal N(i)}a_{ij}\widehat{\mathbf{x}}_j
-+\boldsymbol\delta_i^{\mathrm{src}}.
+\min_{X,Z}
+E_{\mathrm{hair}}(X)+I_{\Omega_{1\mathrm{mm}}}(Z),
+\qquad CX=Z.
 $$
 
-In the intended canonical graph, these are Guide neighbors, so the first part
-is their weighted optimized position. The second part restores the Normal
-point's source-relative offset. Writing the fallback explicitly makes the
-description match the implementation even if a bundle contains a non-Guide
-neighbor. The Normal KNN term is then
+$E_{\mathrm{hair}}$ 由 x-update 处理，人体外部约束由 z-update 处理，$U$ 负责累积
+$CX$ 与 $Z$ 的不一致。
+
+| 泛用 ADMM / OSQP | HairADMM |
+| --- | --- |
+| 将 xyz 打包成通用变量 | 三个坐标共享同一个图稀疏矩阵 |
+| 求解通用 KKT 或 QP 系统 | Guide 使用 PCG，Normal 复用稀疏分解 |
+| 对标量约束区间做投影 | 对三维发丝采样点做人体外部投影 |
+| 约束矩阵通常固定 | 根据残余交点动态扩充采样矩阵 $C$ |
+| 历史实现主要约束顶点 | 同时约束顶点和线段内部位置 |
+
+算法流程为：
+
+~~~text
+输入迁移后的发丝 Init
+        ↓
+求解 Guide 发丝
+  x-update：图结构稀疏线性系统
+  z-update：投影到人体外 1 mm
+  u-update：累计 x 与 z 的差异
+        ↓
+用 Guide 生成 Normal 的目标位置
+        ↓
+求解 Normal 发丝
+        ↓
+Embree 检测残余线段交点
+        ↓
+如有必要，在交点附近增加约束并继续求解
+        ↓
+输出碰撞减少后的发丝
+~~~
+
+## 4. 理论时间与空间复杂度
+
+用下面的符号描述单帧复杂度：
+
+- $N_G,N_N$：Guide 和 Normal 的自由发丝点数；
+- $M_G,M_N$：Guide 和 Normal 的碰撞采样行数；
+- $F$：人体三角面数量；
+- $E_G,E_N$：参与 Embree 检测的发丝线段数；
+- $R$：outer 次数，$I$：每个 outer 的 inner ADMM 次数；
+- $J_G$：Guide 中 PCG 的迭代次数；
+- $Q_G,Q_N$：一次 z-update 中真正执行精确 SDF 查询的 active 样本数；
+- $S_G=\operatorname{nnz}(H_G+\rho C_G^\top C_G)$。
+
+### 4.1 泛用 QP/OSQP
+
+如果把三个坐标打包，通用 QP 的变量规模约为 $3N$，KKT 系统规模约为
 
 $$
-E_{\mathrm{knn}}^{N}
-=\frac{w_{\mathrm{lap}}^{N}}{2}
-\sum_i\lambda_i\|\mathbf{x}^{N}_i-\mathbf{t}_i\|_2^2,
+D=3N+M.
 $$
 
-with $w_{\mathrm{lap}}^{N}=30000$.
-
-The Guide and Normal formulas are therefore related but not identical:
-
-- Guide solves a coupled graph-Laplacian system
-  $L\mathbf{x}^{G}\approx\boldsymbol\delta^{\mathrm{src}}$;
-- Normal receives a pointwise target computed from the solved Guides,
-  $\mathbf{x}^{N}_i\approx\mathbf{t}_i$.
-
-Both stages independently use the same collision machinery described next.
-They are two sub-stages of one post-processing pass, not two different
-published algorithms.
-
----
-
-## 5. Turning hair collisions into a linear sampling operator
-
-### 5.1 The exterior feasible set
-
-Let $\phi_{\mathcal M}(\mathbf{y})$ be signed distance to the target body,
-positive outside and negative inside. With margin $m=1$ mm, define
+设 $\mathcal F_{\mathrm{KKT}}(D)$ 是稀疏 KKT 分解成本，
+$S_{\mathrm{KKT}}$ 是分解后一次回代的非零量，则每次重新建立 QP 的成本可写成
 
 $$
-\Omega_m
-=\{\mathbf{y}\in\mathbb{R}^3:
-\phi_{\mathcal M}(\mathbf{y})\ge m\}.
+T_{\mathrm{generic}}
+=\mathcal O\!\left(
+\mathcal F_{\mathrm{KKT}}(D)
++I_{\mathrm{osqp}}S_{\mathrm{KKT}}
+\right).
 $$
 
-The desired collision condition is
+稀疏分解的实际成本取决于图结构和 fill-in；最坏情况下时间为 $\mathcal O(D^3)$，
+空间为 $\mathcal O(D^2)$。这不是说 OSQP 在本项目中一定达到最坏情况，而是通用求解器不能利用
+HairADMM 后面列出的特殊结构。
+
+### 4.2 HairADMM 的 Guide
+
+Guide 的三个坐标共享同一个 $N_G\times N_G$ 稀疏矩阵。一次 PCG 迭代的主要成本为
+$\mathcal O(S_G)$，因此
 
 $$
-C\mathbf{x}=\mathbf{z},
-\qquad \mathbf{z}\in\Omega_m.
+\begin{aligned}
+T_G
+=\mathcal O\!\Bigl(
+R\bigl[
+S_G
++I(3J_GS_G+M_G+Q_G\log F)
++E_G\log F
+\bigr]
+\Bigr).
+\end{aligned}
 $$
 
-Each row of $C$ evaluates one point on the hair. It is not one mysterious
-scalar constraint: $C$ is a sparse matrix containing many sample rows.
+其中：
 
-### 5.2 Vertex rows
+- $3J_GS_G$ 是三个坐标的 PCG；
+- $M_G$ 是 $C_GX$、$C_G^\top Z$ 和 u-update；
+- $Q_G\log F$ 是复用人体 AABB 树后的 active SDF 查询；
+- $E_G\log F$ 是 Embree 线段查询的平均输出敏感成本。
 
-For every valid non-root hair point $i$, one row simply selects that point:
+### 4.3 HairADMM 的 Normal
 
-$$
-(C\mathbf{x})_r=\mathbf{x}_i.
-$$
-
-The root is fixed to Init and intentionally excluded from collision repair.
-
-### 5.3 Uniform segment rows
-
-For a segment from $\mathbf{x}_i$ to $\mathbf{x}_j$, a point at fractional
-coordinate $\alpha\in[0,1]$ is
+当前 one-step 版本没有 Edge 和时序耦合。Normal 的基础目标是逐点目标，方向项和线段
+采样只连接同一根发丝上的相邻点，因此其矩阵由彼此独立、带宽受限的发丝链组成。记
 
 $$
-\mathbf{p}(\alpha)
-=(1-\alpha)\mathbf{x}_i+\alpha\mathbf{x}_j.
+S_N=\mathcal O(N_N+M_N).
 $$
 
-This is linear in the unknown endpoints, so one row of $C$ contains only
-two nonzero scalar coefficients, $1-\alpha$ and $\alpha$.
-
-For a reference segment of length $\ell$, the implementation chooses
+每个 outer 只分解一次，三个坐标和全部 inner 迭代复用该分解：
 
 $$
-n=\left\lceil\frac{\ell}{h}\right\rceil,
-\qquad h=2\text{ mm},
+T_N
+=\mathcal O\!\Bigl(
+R\bigl[
+S_N
++I(3S_N+M_N+Q_N\log F)
++E_N\log F
+\bigr]
+\Bigr).
 $$
 
-and inserts the interior fractions
+### 4.4 总复杂度
+
+令 $M=M_G+M_N$、$Q=Q_G+Q_N$、$E=E_G+E_N$。HairADMM 单帧的主要时间复杂度为
 
 $$
-\alpha=\frac{1}{n},\frac{2}{n},\ldots,\frac{n-1}{n}.
+\boxed{
+T_{\mathrm{HairADMM}}
+=\mathcal O\!\left(
+RI J_GS_G
++RI S_N
++RI(M+Q\log F)
++RE\log F
+\right)
+}
 $$
 
-Consequently, adjacent checked locations are no more than 2 mm apart. The
-number 2 mm is a **sampling-spacing parameter**; it is unrelated to the 1 mm
-clearance from the body. Root-adjacent segments are excluded because their
-roots are deliberately embedded/attached at the scalp.
-
-### 5.4 Exact Embree feedback
-
-Finite sampling cannot mathematically guarantee that no tiny interval between
-samples crosses a triangle. Before the first outer solve and after each outer
-solve, Embree performs exact segment-triangle intersection queries on every
-non-root-adjacent segment.
-
-If segment $(i,j)$ intersects the body at fraction
-$\alpha_{\mathrm{hit}}$, the next constraint matrix adds rows at
+空间复杂度为
 
 $$
-\operatorname{clip}(\alpha_{\mathrm{hit}}-0.10,0.02,0.98),
-\quad
-\operatorname{clip}(\alpha_{\mathrm{hit}},0.02,0.98),
-\quad
-\operatorname{clip}(\alpha_{\mathrm{hit}}+0.10,0.02,0.98).
+\boxed{
+\mathcal M_{\mathrm{HairADMM}}
+=\mathcal O(S_G+S_N+M+F)
+}
 $$
 
-The offsets are fractions of that segment, not millimetres. Constraining a
-small neighborhood is more stable than constraining only one exact crossing:
-otherwise the segment can rotate around the single repaired point and create
-a nearby crossing in the next update.
+KNN 数量、outer/inner 次数、PCG 次数和单位长度采样密度固定时，
+$S_G=\mathcal O(N_G+M_G)$，HairADMM 对发丝点和约束数量表现为近线性增长；人体查询还带有
+AABB/BVH 的平均 $\mathcal O(\log F)$ 因子。这里的“近线性”依赖 PCG 迭代数保持稳定，不能
+解释为无条件的最坏情况线性保证。
 
-Embree is only a detector. It does not move the hair and is not a second
-post-process. Its hit locations become additional rows of the same $C$,
-which are handled by the next ADMM outer iteration. At most two additional
-constraint-generation outer iterations are allowed in the released setting.
+| 方法/阶段 | 被求解的结构 | 主要时间项 | 主要空间项 |
+| --- | --- | --- | --- |
+| 泛用 QP/OSQP | 规模约为 $D=3N+M$ 的稀疏 KKT 系统 | $\mathcal F_{\mathrm{KKT}}(D)+I_{\mathrm{osqp}}S_{\mathrm{KKT}}$ | 取决于 KKT 分解后的 fill-in；最坏 $\mathcal O(D^2)$ |
+| HairADMM Guide x-update | 三个坐标共享同一个 $N_G\times N_G$ 稀疏系统 | $\mathcal O(3RIJ_GS_G)$ | $\mathcal O(S_G+M_G)$ |
+| HairADMM Normal x-update | 彼此独立、带宽受限的发丝链 | $\mathcal O(RI S_N)$ | $\mathcal O(S_N+M_N)$ |
+| HairADMM 几何查询 | active SDF 查询与 Embree 线段检测 | 平均 $\mathcal O(RIQ\log F+RE\log F)$ | $\mathcal O(F+M)$ |
 
----
+## 5. 当前碰撞结果（纯数值）
 
-## 6. ADMM optimization
+保留实验包含 7 个发型序列，共 2,702 帧：
 
-### 6.1 Why introduce $\mathbf{z}$?
+| 指标 | Init | 历史顶点 QP | HairADMM | 相对 QP 减少 |
+| --- | ---: | ---: | ---: | ---: |
+| 穿入人体的发丝点数 | 1,275 | 442 | **15** | **96.61%** |
+| 线段与人体相交数 | 97,490 | 31,598 | **127** | **99.60%** |
 
-The hairstyle objective is easiest to optimize in the original variables
-$\mathbf{x}$. Collision feasibility is easiest to enforce on the sampled
-positions $C\mathbf{x}$. ADMM introduces a copy $\mathbf{z}$ so each side
-can be handled by the operation it naturally supports:
+运行时间暂不作为当前发布结论，后续将在统一硬件、输入、线程数和计时边界下重新评估。
 
-$$
-\min_{\mathbf{x},\mathbf{z}}
-E_{\mathrm{base}}(\mathbf{x})+I_{\Omega_m}(\mathbf{z})
-\quad\text{s.t.}\quad C\mathbf{x}-\mathbf{z}=0,
-$$
+## 6. 快速运行
 
-where $I_{\Omega_m}(\mathbf{z})=0$ when every row of $\mathbf{z}$ lies in
-the feasible set and $+\infty$ otherwise.
+创建环境：
 
-The three inner ADMM updates are
+~~~bash
+conda env create -f environment.yml
+conda activate hairadmm
+~~~
 
-$$
-\mathbf{x}^{k+1}
-=\arg\min_{\mathbf{x}}
-E_{\mathrm{base}}(\mathbf{x})
-+\frac{\rho}{2}
-\|C\mathbf{x}-\mathbf{z}^{k}+\mathbf{u}^{k}\|_2^2,
-$$
+运行公开入口：
 
-$$
-\mathbf{z}^{k+1}
-=\Pi_{\Omega_m}
-(C\mathbf{x}^{k+1}+\mathbf{u}^{k}),
-$$
-
-$$
-\mathbf{u}^{k+1}
-=\mathbf{u}^{k}+C\mathbf{x}^{k+1}-\mathbf{z}^{k+1}.
-$$
-
-Their roles are:
-
-- $\mathbf{x}$: the actual hair geometry;
-- $\mathbf{z}$: a collision-feasible version of every sampled hair point;
-- $\mathbf{u}$: accumulated disagreement between the hair and the feasible
-  samples;
-- $\rho=100000$: how strongly the current iteration asks
-  $C\mathbf{x}$ to match $\mathbf{z}$.
-
-`z` is therefore not a vector of ones and is not a Boolean inside/outside
-label. It stores 3D projected positions, one for every selected row of $C$.
-
-### 6.2 The x-update
-
-After the shape term is majorized in the current outer iteration, write its
-quadratic objective as
-
-$$
-E_{\mathrm{base}}(\mathbf{x})
-\approx\frac12\mathbf{x}^{\top}H\mathbf{x}
--\mathbf{b}^{\top}\mathbf{x}+\text{constant}.
-$$
-
-With fixed roots eliminated, the x-update becomes the sparse symmetric
-positive-definite system
-
-$$
-(H+\rho C^{\top}C)\mathbf{x}^{k+1}
-=\mathbf{b}+\rho C^{\top}
-(\mathbf{z}^{k}-\mathbf{u}^{k}).
-$$
-
-The same scalar sparse matrix is solved for the x, y, and z coordinate
-columns. The Guide stage uses preconditioned conjugate gradients. The Normal
-stage can factor its simpler system once and reuse the factorization across
-inner iterations. The roots are restored to their Init positions after every
-solve.
-
-### 6.3 The z-update
-
-For every queried point $\mathbf{y}=C\mathbf{x}+\mathbf{u}$, the solver
-computes signed distance to the body. If the point already satisfies
-$\phi_{\mathcal M}(\mathbf{y})\ge1$ mm, it is unchanged. Otherwise it is
-moved to the closest surface location plus 1 mm along the outward normal.
-
-The released optimizer uses reusable pseudonormal signed distance for this
-projection. Winding-number signed distance is reserved for the independent
-point-penetration evaluation, so the reported metric is not simply the
-solver's own local collision test.
-
-This is a local signed-distance projection. It relies on a consistently
-oriented target mesh and should not be interpreted as an exact global
-projection for an arbitrary non-convex or non-watertight body.
-
-The implementation caches safe far-away rows. A row is queried again only if
-a conservative lower bound says it may have entered the near-surface active
-band. This changes query cost, not the mathematical constraint.
-
-### 6.4 The u-update
-
-The scaled dual update
-
-$$
-\mathbf{u}\leftarrow\mathbf{u}+C\mathbf{x}-\mathbf{z}
-$$
-
-remembers unresolved disagreement. If the shape update repeatedly pulls a
-sample back toward the body, $\mathbf{u}$ grows in the opposing direction
-and makes later x-updates pay more attention to that sample.
-
-### 6.5 Outer and inner loops
-
-One stage uses up to four base outer iterations. Each outer iteration:
-
-1. rebuilds the quadratic surrogate of the direction-preservation term;
-2. rebuilds $C$ if Embree added new samples;
-3. initializes $\mathbf{z}^{0}=\Pi_{\Omega_m}(C\mathbf{x})$ and
-   $\mathbf{u}^{0}=0$, then performs ten x/z/u ADMM inner iterations;
-4. checks all hair segments with Embree;
-5. adds feedback samples and, if necessary, allows up to two refinement
-   outers.
-
-The complete released algorithm is:
-
-```text
-Input: Init, source-aligned hair, target body, canonical objective tensors
-
-1. Fix roots to their Init positions.
-2. Build vertex rows and <=2 mm uniform segment rows for Guide strands.
-3. Optimize Guide strands:
-     outer majorization / constraint-generation loop
-       repeat 10 times: x-update, z-update, u-update
-       run exact Embree segment tests and add hit-neighborhood rows
-4. Construct each Normal target from optimized Guide neighbors
-   plus its source-relative offset.
-5. Build the same collision rows for Normal strands.
-6. Optimize Normal strands with the same outer/inner procedure.
-7. Combine fixed roots, optimized Guides, and optimized Normals.
-
-Output: one collision-reduced hairstyle for the frame
-```
-
-Each frame is solved independently. No previous or next frame is read by the
-released configuration.
-
----
-
-## 7. Computational form
-
-Let $N$ be the number of free hair points, $M$ the number of active
-collision samples, $k$ the KNN degree, $T_{\mathrm{CG}}$ the number of
-conjugate-gradient iterations, and $T_{\mathrm{ADMM}}=10$.
-
-The sparse matrices contain approximately $O(Nk+M)$ nonzeros. One iterative
-x-update costs approximately
-
-$$
-O\!\left(T_{\mathrm{CG}}(Nk+M)\right),
-$$
-
-so one outer Guide solve is approximately
-
-$$
-O\!\left(T_{\mathrm{ADMM}}T_{\mathrm{CG}}(Nk+M)
-+Q_{\mathrm{SDF}}+Q_{\mathrm{Embree}}\right),
-$$
-
-where the last two terms are the signed-distance and exact intersection query
-costs. Storage is $O(Nk+M)$, excluding acceleration structures. Actual
-runtime also depends strongly on sparse-factor fill-in, body-mesh size, and
-how many samples enter the near-surface active set, so these expressions are
-structural bounds rather than a wall-clock prediction.
-
----
-
-## 8. Evaluation
-
-### 8.1 Fair comparison protocol
-
-All reported methods use the same 2,702 frames from seven hairstyle
-sequences. QP and HairADMM receive the same:
-
-- Init and source-aligned hair;
-- target body mesh;
-- Guide selection and both KNN graphs;
-- KNN and per-point local weights;
-- fidelity, KNN, and direction-preservation base objective.
-
-Only the collision treatment and numerical solver differ. Solver-specific
-penalty values are not reported as a cross-method objective comparison.
-
-The metrics are:
-
-- **Point penetrations:** valid non-root vertices classified inside by
-  winding-number signed distance.
-- **Segment intersections:** exact Embree segment-triangle hits, excluding the
-  root-adjacent segment.
-- **Algorithm time:** Guide and Normal optimization time, excluding unrelated
-  dataset I/O and evaluation.
-
-### 8.2 Results
-
-| Metric | Init | QP baseline | HairADMM one-step |
-| --- | ---: | ---: | ---: |
-| Point penetrations | 1,275 | 442 | **15** |
-| Segment intersections | 97,490 | 31,598 | **127** |
-| Per-frame runtime | — | **~300 s** (historical estimate) | **4.119 s** (instrumented algorithm time) |
-
-Relative to QP, HairADMM reduces measured point penetrations by **96.61%** and
-segment intersections by **99.60%**. Comparing the representative historical
-QP estimate with the recorded HairADMM mean gives a representative speed ratio
-of roughly **72.8x**. This ratio is an engineering reference, not a controlled
-solver benchmark: the QP number is a historical wall-clock estimate, whereas
-4.119 s is the mean solver-recorded HairADMM algorithm time.
-
-Detailed definitions are repeated in
-[`results/README.md`](results/README.md), and the machine-readable summary is
-[`results/summary.csv`](results/summary.csv).
-
----
-
-## 9. Canonical input format
-
-Run the public entry point on a directory containing one
-`frame_XXXX.npz` bundle per frame:
-
-```bash
+~~~bash
 python tools/run_hair_admm.py \
   --objective_tensor_dir /path/to/problem_bundles \
   --output_dir /path/to/output
-```
+~~~
 
-Each bundle stores:
+运行不包含私有资产的玩具示例：
 
-- `initial_transfer_pos`, `source_aligned`;
-- `hair_starts`, `hair_lengths`, `guide_strand_indices`;
-- Guide and Normal KNN indices and weights;
-- Guide and Normal source Laplacian/offset targets;
-- local fidelity and Laplacian weights;
-- source and target root positions;
-- target body vertices and triangular faces;
-- the three base energy weights and enable flags.
-
-The schema is validated by
-[`hairs_adaption/qp_objective_bundle.py`](hairs_adaption/qp_objective_bundle.py).
-A malformed bundle, mismatched topology, unsupported unit, or incompatible
-local-weight convention fails before optimization. This explicit contract is
-how we prevent the QP and ADMM paths from quietly constructing different
-objectives. The public wrapper requires the corrected local-weight convention;
-it does not reproduce the historical root-weight overwrite behavior.
-
----
-
-## 10. Installation, server environment, and toy example
-
-The full evaluation was run on the following server environment:
-
-- Ubuntu 22.04.4 LTS, Linux 6.5;
-- 2x Intel Xeon Silver 4210R CPUs, 20 physical cores / 40 logical CPUs total;
-- 125 GiB system memory;
-- 4x NVIDIA GeForce RTX 3090, 24 GiB each;
-- Python 3.10.0;
-- NumPy 1.26.4, SciPy 1.12.0, trimesh 4.8.3, embreex 4.4.0,
-  libigl 2.5.0, CVXPY 1.7.5, and OSQP 1.0.5.
-
-The released HairADMM solver uses CPU sparse linear algebra and does not
-require the GPUs. Create the portable release environment with:
-
-```bash
-conda env create -f environment.yml
-conda activate hairadmm
-```
-
-The core runtime uses NumPy, SciPy, libigl, trimesh, and Embree. No GPU is
-required.
-
-The repository contains a synthetic one-frame example with deliberately
-penetrating strands and a triangulated sphere. It is generated from code and
-contains no private human or hairstyle assets:
-
-```bash
+~~~bash
 python examples/toy_case/run_demo.py
-```
+~~~
 
-The example begins with 8 interior non-root vertices and 8 exact segment
-intersections. Verification requires both counts to reach zero. Output is
-written to:
+运行测试：
 
-```text
-examples/toy_case/output/
-├── hair/frame_0000.npz
-├── hair/frame_0000.obj
-└── metrics/frame_0000.json
-```
-
-Run the unit tests with:
-
-```bash
+~~~bash
 python -m unittest discover -s tests -v
-```
+~~~
 
----
+## 7. 输入与输出
 
-## 11. Visualize the body and hair together
+每一帧输入为一个 frame_XXXX.npz，主要包含：
 
-The toy command prepares a browser cache automatically. Start a local server:
+- 初始迁移发丝和源对齐发丝；
+- 发丝拓扑、Guide 集合和 KNN；
+- 局部权重和能量权重；
+- 目标人体顶点和三角面。
 
-```bash
+输出包含优化后的 NPZ 和 OBJ 发丝文件。
+
+同时查看人体和发丝：
+
+~~~bash
 cd tools/web
 python -m http.server 8888
-```
+~~~
 
-Open:
+然后打开：
 
-```text
+~~~text
 http://localhost:8888/viewer.html?manifest=frames_toy_case.json
-```
+~~~
 
-For another result sequence:
+## 8. 主要文件
 
-```bash
-python tools/preprocess_strands_bin.py \
-  --hair_dir /path/to/output/hair \
-  --body_dir /path/to/body_objs \
-  --out tools/web/cache/my_sequence \
-  --manifest frames_my_sequence.json
-```
+~~~text
+configs/one_step.json                 算法配置
+hairs_adaption/qp_objective_bundle.py 输入数据格式
+tools/run_hair_admm.py                公开运行入口
+tools/solve_admm_qp_aligned.py        Guide/Normal ADMM 求解器
+examples/toy_case/                    玩具示例
+tools/web/                            人体与发丝可视化
+results/                              实验结果
+~~~
 
-Body files must be named `body_<frame>.obj`; hair files may be
-`frame_<frame>.npz` or `frame_<frame>.obj`.
+## 许可证
 
----
-
-## 12. Limitations
-
-- The method assumes an upstream transfer already produced a plausible Init;
-  it does not repair a completely incorrect hairstyle or root mapping.
-- Finite segment sampling plus iterative Embree feedback gives strong
-  empirical reduction, not a mathematical global non-intersection proof.
-- The local signed-distance projection relies on consistently oriented body
-  normals and can be unreliable for severely non-watertight meshes.
-- Roots and root-adjacent segments are intentionally excluded from collision
-  evaluation because roots attach at the scalp.
-- All 127 remaining measured segment intersections are concentrated in the
-  `girl_long` sequence.
-- The full private dataset and body/hairstyle assets are not distributed.
-- Applying the method to a new transfer pipeline requires an adapter that
-  exports its data to the canonical bundle schema. This repository includes a
-  complete toy generator, but not a universal raw-hair transfer or converter.
-- The approximately 300 s/frame QP reference is based on historical runs and
-  retained output timestamps, not a newly repeated solver-internal benchmark.
-
----
-
-## 13. Repository map
-
-```text
-configs/one_step.json                 released algorithm configuration
-hairs_adaption/qp_objective_bundle.py canonical tensor contract
-tools/run_hair_admm.py                public one-step entry point
-tools/solve_admm_qp_aligned.py        Guide/Normal ADMM engine
-examples/toy_case/                    redistributable end-to-end example
-tools/web/                            body-and-hair browser viewer
-results/                              measured aggregate results
-tests/                                objective-bundle tests
-```
-
-## License
-
-The code is released under the [MIT License](LICENSE) as a research prototype,
-without warranty. Dataset and model assets are not included.
+代码以 [MIT License](LICENSE)发布。数据集、人体和发型资产不包含在仓库中。

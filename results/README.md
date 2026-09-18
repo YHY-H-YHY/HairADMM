@@ -1,27 +1,30 @@
-# Evaluation summary
+# 当前保留的初步实验结果
 
-All geometry values were measured on the same 2,702 frames from seven
-hairstyle sequences. Point penetration uses winding-number signed distance on
-valid non-root points. Segment collision uses exact Embree segment-triangle
-intersection and excludes the root-adjacent segment.
+本页保留上一版本的实验数字，等待重新完成分组件受控实验。这些数字能够说明保留输出
+的情况，但还不能分别证明图结构 x-update、几何感知 z-update 和自适应采样算子的
+独立贡献。
 
-| Metric | Init | QP baseline | HairADMM one-step |
-| --- | ---: | ---: | ---: |
-| Point penetrations | 1,275 | 442 | **15** |
-| Segment intersections | 97,490 | 31,598 | **127** |
-| Per-frame runtime | — | **~300 s** (historical estimate) | **4.119 s** (instrumented algorithm time) |
+历史 QP 由 OSQP 求解，而 OSQP 本身就是基于 ADMM 的方法。因此，新的算法比较不应
+写成“QP 对 ADMM”，而应写成：
 
-Relative to QP, HairADMM reduces point penetrations by 96.61%, segment
-intersections by 99.60%, and has a representative speed ratio of approximately
-72.8x.
+- 通用的逐顶点 QP/ADMM；
+- 面向三维发丝图专门设计的几何感知、图结构 ADMM。
 
-The runtime comparison is intentionally qualified. The QP value is a
-historical wall-clock engineering estimate; no complete solver-internal QP
-timing series was retained. QP output timestamps provide a partial
-cross-check: median adjacent-output intervals are 282.5 s for `curly` and
-318.7 s for `girl_long`, while simpler sequences are faster. HairADMM's
-4.119 s/frame is the solver-recorded algorithm mean and excludes unrelated
-I/O and offline evaluation.
+所有几何指标都在相同的 7 个发型序列、共 2,702 帧上测量。点穿透使用
+winding-number 有符号距离，只统计有效非发根点；线段碰撞使用 Embree 精确
+线段—三角形相交测试，并排除发根相邻线段。
 
-The method is not a strict global non-collision guarantee. All 127 residual
-segment intersections are concentrated in the `girl_long` sequence.
+| 指标 | Init | 历史顶点 QP 基线 | HairADMM | 相对 QP 减少 |
+| --- | ---: | ---: | ---: | ---: |
+| 穿入人体的发丝点数 | 1,275 | 442 | **15** | **96.61%** |
+| 线段与人体相交数 | 97,490 | 31,598 | **127** | **99.60%** |
+
+运行时间暂不进入公开结果：历史 QP 和 HairADMM 的计时口径不同，无法形成公平的速度
+对比。当前版本只报告由代码结构推导的理论复杂度；实测时间将在统一硬件、输入、线程数和
+计时边界后重新给出。完整规则见 [复现实验规范](../docs/reproducibility.md)。
+
+在完成复现实验规范中的五组受控配置，并采用相同计时边界评估以前，不应把这些数字
+直接写成论文的最终算法结论。
+
+本方法也不提供严格的全局无碰撞数学保证。当前剩余的 127 个线段相交全部集中在
+girl_long 序列。
